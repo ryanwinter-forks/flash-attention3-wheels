@@ -14,7 +14,7 @@
 param(
     [string]$CudaVersion = "12.8",
     [string]$TorchVersion = "2.8.0",
-    [string]$MaxJobs = "4"
+    [string]$MaxJobs = "1"
 )
 
 $ErrorActionPreference = "Stop"
