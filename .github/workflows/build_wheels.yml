@@ -22,33 +22,10 @@ env:
   IMAGE_PROJECT: ubuntu-os-cloud
 
 jobs:
-  check-biweekly:
-    runs-on: ubuntu-latest
-    outputs:
-      run: ${{ steps.check.outputs.run }}
-    steps:
-      - id: check
-        run: |
-          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
-            echo "run=true" >> "$GITHUB_OUTPUT"
-            echo "Manually triggered, skipping biweekly check"
-            exit 0
-          fi
-
-          week=$(date -u +%V)
-          echo "Week No. ${week}..."
-          if [ $((10#$week % 2)) -eq 0 ]; then
-            echo "run=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "run=true" >> "$GITHUB_OUTPUT"
-          fi
-
   prepare-matrix:
-    needs: check-biweekly
-    if: needs.check-biweekly.outputs.run == 'true'
     runs-on: ubuntu-latest
     outputs:
-      win-matrix:   ${{ steps.win.outputs.matrix }}
+      win-matrix: ${{ steps.win.outputs.matrix }}
     steps:
       - uses: actions/checkout@v6
       - name: Generate Windows matrix
