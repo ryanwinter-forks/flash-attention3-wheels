@@ -41,6 +41,11 @@ jobs:
       matrix: ${{fromJson(needs.prepare-matrix.outputs.win-matrix)}}
 
     steps:
+      - name: configure Pagefile
+        uses: al-cheb/configure-pagefile-action@v1.2
+        with:
+          minimum-size: 24GB
+
       - name: Enable Windows long-path
         shell: pwsh
         run: |
