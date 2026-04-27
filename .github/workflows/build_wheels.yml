@@ -35,7 +35,7 @@ jobs:
   build-win-wheels:
     needs: prepare-matrix
     runs-on: windows-latest
-    timeout-minutes: 60
+    timeout-minutes: 1800
     strategy:
       fail-fast: false
       matrix: ${{fromJson(needs.prepare-matrix.outputs.win-matrix)}}
