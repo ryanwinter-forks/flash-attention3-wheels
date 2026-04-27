@@ -16,11 +16,6 @@ on:
         required: false
         default: 'v0.2.35'
 
-env:
-  PROJECT_ID: coherent-vim-471701-r7
-  ZONE: us-central1-a
-  IMAGE_PROJECT: ubuntu-os-cloud
-
 jobs:
   prepare-matrix:
     runs-on: ubuntu-latest
@@ -39,8 +34,8 @@ jobs:
 
   build-win-wheels:
     needs: prepare-matrix
-    runs-on: "cirun-azure-windows-runner--${{ github.run_id }}"
-    timeout-minutes: 1080
+    runs-on: windows-latest
+    timeout-minutes: 60
     strategy:
       max-parallel: 3
       fail-fast: false
@@ -88,16 +83,8 @@ jobs:
           path: C:\tmp\wheels\*.whl
           retention-days: 7
 
-  all-wheels-done:
-    needs:
-      - build-win-wheels
-    runs-on: ubuntu-latest
-    if: success()
-    steps:
-      - run: echo "All wheels built successfully."
-
   create-release:
-    needs: all-wheels-done
+    needs: build-win-wheels
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
