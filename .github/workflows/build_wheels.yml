@@ -1,8 +1,6 @@
 name: Build Flash-Attention 3 Wheels
 
 on:
-  schedule:
-    - cron: '0 22 * * 0'
   workflow_dispatch:
     inputs:
       cuda_versions:
@@ -50,18 +48,9 @@ jobs:
     if: needs.check-biweekly.outputs.run == 'true'
     runs-on: ubuntu-latest
     outputs:
-      linux-matrix: ${{ steps.linux.outputs.matrix }}
       win-matrix:   ${{ steps.win.outputs.matrix }}
-      arm-matrix:   ${{ steps.arm.outputs.matrix }}
     steps:
       - uses: actions/checkout@v6
-      - name: Generate Linux matrix
-        id: linux
-        env:
-          MATRIX_TARGET: linux
-          CUDA_VERSIONS: ${{ inputs.cuda_versions }}
-          TORCH_VERSIONS: ${{ inputs.torch_versions }}
-        run: python scripts/generate_matrix.py
       - name: Generate Windows matrix
         id: win
         env:
@@ -70,241 +59,6 @@ jobs:
           TORCH_VERSIONS: ${{ inputs.torch_versions }}
           JIMVER_CUDA_TOOLKIT_VERSION: ${{ inputs.jimver_cuda_toolkit_version || 'v0.2.35'}}
         run: python scripts/generate_matrix.py
-      - name: Generate Arm matrix
-        id: arm
-        env:
-          MATRIX_TARGET: arm
-          CUDA_VERSIONS: ${{ inputs.cuda_versions }}
-          TORCH_VERSIONS: ${{ inputs.torch_versions }}
-        run: python scripts/generate_matrix.py
-
-  build-wheels:
-    needs: prepare-matrix
-    runs-on: ubuntu-latest
-    timeout-minutes: 600
-    env:
-      MACHINE_TYPE: n2-custom-16-65536
-      IMAGE: ubuntu-2204-jammy-v20230615
-    strategy:
-      max-parallel: 3
-      fail-fast: false
-      matrix: ${{fromJson(needs.prepare-matrix.outputs.linux-matrix)}}
-    outputs:
-      status: ${{ job.status }}
-    steps:
-      - uses: actions/checkout@v6
-      - uses: google-github-actions/auth@v3
-        with:
-          credentials_json: ${{ secrets.GCP_SA_KEY }}
-      - uses: google-github-actions/setup-gcloud@v3
-
-      - name: Prepare SSH key
-        run: |
-          echo "${{ secrets.GCP_SSH_KEY }}" > gha-runner
-          chmod 600 gha-runner
-
-      - name: Create Spot VM and build wheel
-        run: |
-            set -euo pipefail
-            CUDA="${{ matrix.cuda }}"
-            TORCH="${{ matrix.torch }}"
-            ID=$(uuidgen | cut -d- -f1)
-            PREFIX="spot-${GITHUB_RUN_NUMBER}-cu${CUDA//./-}-torch${TORCH//./-}"
-            NAME="${PREFIX}-${ID}"
-
-            gcloud compute instances list \
-              --filter="name~'^${PREFIX}' AND zone=${ZONE}" \
-              --format="value(name)" | \
-            while read -r OLD; do
-              [[ -n "$OLD" ]] && \
-                gcloud compute instances delete "$OLD" --zone="$ZONE" --quiet || true
-            done
-
-            gcloud compute instances create "$NAME" \
-              --project=$PROJECT_ID --zone=$ZONE \
-              --machine-type=$MACHINE_TYPE \
-              --provisioning-model=SPOT \
-              --instance-termination-action=DELETE \
-              --boot-disk-size=100 \
-              --boot-disk-type=pd-ssd \
-              --max-run-duration=5h \
-              --image=$IMAGE --image-project=$IMAGE_PROJECT \
-              --metadata=ssh-keys="ubuntu:ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDHClYdm3FsSNxqo7Dsbz3pZbG10Vkm8tQPPEjMhIlCj gha-runner" \
-              --labels=gh-runner=spot,workflow=$GITHUB_RUN_ID
-
-            IP=$(gcloud compute instances describe "$NAME" \
-                  --zone=$ZONE --format="value(networkInterfaces[0].accessConfigs[0].natIP)")
-            for i in {1..30}; do
-              ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-                  -i gha-runner ubuntu@$IP "echo OK" && break || sleep 10
-            done
-
-            ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-                -i gha-runner ubuntu@$IP << 'EOF'
-              set -ex
-              sudo sed -i 's|http://archive.ubuntu.com|http://us-central1.gce.archive.ubuntu.com|g' /etc/apt/sources.list
-              sudo apt-get update
-              sudo apt-get install -y git build-essential ninja-build curl python3-pip docker.io
-
-              curl -sSO https://dl.google.com/cloudagents/add-google-cloud-ops-agent-repo.sh
-              sudo bash add-google-cloud-ops-agent-repo.sh --also-install
-              sudo systemctl enable google-cloud-ops-agent
-              sudo systemctl start google-cloud-ops-agent
-
-              git clone https://github.com/${{ github.repository }}.git flash-attention
-              cd flash-attention
-              git checkout ${{ github.sha }}
-              sudo mkdir -p /tmp/wheels
-              sudo docker run --rm -v $PWD:/workspace -v /tmp/wheels:/tmp/wheels \
-                -e CUDA="${{ matrix.cuda }}" -e TORCH="${{ matrix.torch }}" \
-                nvidia/cuda:${{ matrix.cuda_full }}-devel-ubuntu22.04 \
-                bash -c '
-                  sed -i "s|http://archive.ubuntu.com|http://us-central1.gce.archive.ubuntu.com|g" /etc/apt/sources.list
-                  cd /workspace
-                  apt-get update && apt-get install -y python-is-python3 git ninja-build python3-pip python3-dev
-                  bash scripts/build_wheel.sh ${{ matrix.cuda }} ${{ matrix.torch }} 8 | grep -v "ptxas info" | grep -v "bytes stack frame,"
-                '
-            EOF
-            mkdir -p /tmp/wheels
-            scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-                -i gha-runner -r ubuntu@$IP:/tmp/wheels/*.whl /tmp/wheels/
-
-      - name: Upload wheel artifact
-        uses: actions/upload-artifact@v7
-        with:
-          name: wheel-cu${{ matrix.cuda }}-torch${{ matrix.torch }}
-          path: /tmp/wheels/*.whl
-          retention-days: 7
-
-      - name: Cleanup VM
-        run: |
-          set -euo pipefail
-          CUDA="${{ matrix.cuda }}"
-          TORCH="${{ matrix.torch }}"
-          PREFIX="spot-${GITHUB_RUN_NUMBER}-cu${CUDA//./-}-torch${TORCH//./-}"
-
-          gcloud compute instances list \
-            --filter="name~'^${PREFIX}' AND zone=${ZONE}" \
-            --format="value(name)" | \
-          while read -r OLD; do
-            [[ -n "$OLD" ]] && \
-              gcloud compute instances delete "$OLD" --zone="$ZONE" --quiet || true
-          done
-
-  build-arm-wheels:
-    needs: prepare-matrix
-    runs-on: ubuntu-latest
-    timeout-minutes: 1080
-    env:
-      ZONE: us-central1-f
-      MACHINE_TYPE: t2a-standard-16
-      IMAGE: ubuntu-2204-jammy-arm64-v20240927
-    strategy:
-      max-parallel: 3
-      fail-fast: false
-      matrix: ${{fromJson(needs.prepare-matrix.outputs.arm-matrix)}}
-    outputs:
-      status: ${{ job.status }}
-    steps:
-      - uses: actions/checkout@v6
-      - uses: google-github-actions/auth@v3
-        with:
-          credentials_json: ${{ secrets.GCP_SA_KEY }}
-      - uses: google-github-actions/setup-gcloud@v3
-
-      - name: Prepare SSH key
-        run: |
-          echo "${{ secrets.GCP_SSH_KEY }}" > gha-runner
-          chmod 600 gha-runner
-
-      - name: Create Spot VM and build wheel
-        run: |
-            set -euo pipefail
-            CUDA="${{ matrix.cuda }}"
-            TORCH="${{ matrix.torch }}"
-            ID=$(uuidgen | cut -d- -f1)
-            PREFIX="spot-${GITHUB_RUN_NUMBER}-arm-cu${CUDA//./-}-torch${TORCH//./-}"
-            NAME="${PREFIX}-${ID}"
-
-            gcloud compute instances list \
-              --filter="name~'^${PREFIX}' AND zone=${ZONE}" \
-              --format="value(name)" | \
-            while read -r OLD; do
-              [[ -n "$OLD" ]] && \
-                gcloud compute instances delete "$OLD" --zone="$ZONE" --quiet || true
-            done
-
-            gcloud compute instances create "$NAME" \
-              --project=$PROJECT_ID --zone=$ZONE \
-              --machine-type=$MACHINE_TYPE \
-              --provisioning-model=SPOT \
-              --instance-termination-action=DELETE \
-              --boot-disk-size=100 \
-              --boot-disk-type=pd-ssd \
-              --max-run-duration=8h \
-              --image=$IMAGE --image-project=$IMAGE_PROJECT \
-              --metadata=ssh-keys="ubuntu:ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDHClYdm3FsSNxqo7Dsbz3pZbG10Vkm8tQPPEjMhIlCj gha-runner" \
-              --labels=gh-runner=spot,workflow=$GITHUB_RUN_ID
-
-            IP=$(gcloud compute instances describe "$NAME" \
-                  --zone=$ZONE --format="value(networkInterfaces[0].accessConfigs[0].natIP)")
-            for i in {1..30}; do
-              ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-                  -i gha-runner ubuntu@$IP "echo OK" && break || sleep 10
-            done
-
-            ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-                -i gha-runner ubuntu@$IP << 'EOF'
-              set -ex
-              sudo sed -i 's|http://archive.ubuntu.com|http://us-central1.gce.archive.ubuntu.com|g' /etc/apt/sources.list
-              sudo apt-get update
-              sudo apt-get install -y git build-essential ninja-build curl python3-pip docker.io
-
-              curl -sSO https://dl.google.com/cloudagents/add-google-cloud-ops-agent-repo.sh
-              sudo bash add-google-cloud-ops-agent-repo.sh --also-install
-              sudo systemctl enable google-cloud-ops-agent
-              sudo systemctl start google-cloud-ops-agent
-
-              git clone https://github.com/${{ github.repository }}.git flash-attention
-              cd flash-attention
-              git checkout ${{ github.sha }}
-              sudo mkdir -p /tmp/wheels
-              sudo docker run --rm -v $PWD:/workspace -v /tmp/wheels:/tmp/wheels \
-                -e CUDA="${{ matrix.cuda }}" -e TORCH="${{ matrix.torch }}" \
-                nvidia/cuda:${{ matrix.cuda_full }}-devel-ubuntu22.04 \
-                bash -c '
-                  sed -i "s|http://archive.ubuntu.com|http://us-central1.gce.archive.ubuntu.com|g" /etc/apt/sources.list
-                  cd /workspace
-                  apt-get update && apt-get install -y python-is-python3 git ninja-build python3-pip python3-dev
-                  bash scripts/build_wheel.sh ${{ matrix.cuda }} ${{ matrix.torch }} 5 | grep -v "ptxas info" | grep -v "bytes stack frame,"
-                '
-            EOF
-            mkdir -p /tmp/wheels
-            scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-                -i gha-runner -r ubuntu@$IP:/tmp/wheels/*.whl /tmp/wheels/
-
-      - name: Upload wheel artifact
-        uses: actions/upload-artifact@v7
-        with:
-          name: wheel-arm-cu${{ matrix.cuda }}-torch${{ matrix.torch }}
-          path: /tmp/wheels/*.whl
-          retention-days: 7
-
-      - name: Cleanup VM
-        run: |
-          set -euo pipefail
-          CUDA="${{ matrix.cuda }}"
-          TORCH="${{ matrix.torch }}"
-          PREFIX="spot-${GITHUB_RUN_NUMBER}-arm-cu${CUDA//./-}-torch${TORCH//./-}"
-
-          gcloud compute instances list \
-            --filter="name~'^${PREFIX}' AND zone=${ZONE}" \
-            --format="value(name)" | \
-          while read -r OLD; do
-            [[ -n "$OLD" ]] && \
-              gcloud compute instances delete "$OLD" --zone="$ZONE" --quiet || true
-          done
-
 
   build-win-wheels:
     needs: prepare-matrix
@@ -359,34 +113,11 @@ jobs:
 
   all-wheels-done:
     needs:
-      - build-wheels
-      - build-arm-wheels
       - build-win-wheels
     runs-on: ubuntu-latest
     if: success()
     steps:
       - run: echo "All wheels built successfully."
-
-  cleanup:
-    needs:
-      - build-wheels
-      - build-arm-wheels
-    if: always()
-    runs-on: ubuntu-latest
-    steps:
-      - uses: google-github-actions/auth@v3
-        with:
-          credentials_json: ${{ secrets.GCP_SA_KEY }}
-      - uses: google-github-actions/setup-gcloud@v3
-      - name: Delete all Spot VMs created by this workflow
-        run: |
-          gcloud compute instances list \
-            --filter="labels.workflow=${{ github.run_id }} AND labels.gh-runner=spot" \
-            --format="value(name)" | while read -r NAME; do
-            echo "Deleting $NAME"
-            gcloud compute instances stop "$NAME" --zone="$ZONE" --quiet || true
-            gcloud compute instances delete "$NAME" --zone="$ZONE" --quiet || true
-          done
 
   create-release:
     needs: all-wheels-done
@@ -426,9 +157,3 @@ jobs:
         run: |
           gh release edit "${{ steps.tag.outputs.tag }}" \
              --draft=false --repo "${{ github.repository }}"
-
-  update-pages:
-    needs: create-release
-    uses: ./.github/workflows/update-pages.yml
-    with:
-      release_tag: ${{ needs.create-release.outputs.tag }}
